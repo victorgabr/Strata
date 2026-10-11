@@ -1,7 +1,7 @@
 """Tests for #1129: the sampling defaults a client that asks for none gets (--thinking / --instruct).  No GPU, no
-network, nothing installed: the numbers are the model card's own, setup writes them into strata-<model>.json, thinking
-is what a setup run with no flag writes while numbers of the user's own survive it, a start saves a new preset for the
-model, and the settings line of a start says which numbers are in use.
+network, nothing installed: the numbers are the model card's own, a flag writes the set it names into
+strata-<model>.json while a run with no flag writes no block - numbers of the user's own survive it - a start saves a
+new preset for the model, and the settings line of a start says which numbers are in use.
 
     python -m unittest tools.test_setup_sampling
 """
@@ -51,7 +51,6 @@ class Preset(unittest.TestCase):
         self.assertEqual(setup.sampling_choice("thinking"), THINKING)
         self.assertEqual(setup.sampling_choice("instruct"), INSTRUCT)
         self.assertIsNone(setup.sampling_choice(None))          # no preset in the name
-        self.assertEqual(runconfig.DEFAULT_SAMPLING_PRESET, "thinking")     # what a run that names no flag writes
         self.assertIsNone(setup.sampling_choice("nope"))
         self.assertEqual(runconfig.preset_of(dict(THINKING)), "thinking")
         self.assertEqual(runconfig.preset_of(dict(INSTRUCT)), "instruct")
@@ -61,8 +60,8 @@ class Preset(unittest.TestCase):
 
 
 class Install(unittest.TestCase):
-    """setup.main() on a mocked PC: the flag writes that preset into the new config, no flag writes the default
-    thinking preset, and numbers the file already has of its own stay."""
+    """setup.main() on a mocked PC: the flag writes that preset into the new config, no flag writes no block, and
+    numbers the file already has of its own stay."""
     RAM, CARDS = PROFILES["64GB-1x32GB"]
     ARGV = ["--family", "qwen", "--model", "IQ3_S", "--no-start"]
 
@@ -82,17 +81,17 @@ class Install(unittest.TestCase):
         self.assertEqual(cfg["sampling"], INSTRUCT)
         self.assertIn("sampling for requests that send none: instruct", out)
 
-    def test_no_flag_writes_the_default_thinking_block(self):
+    def test_no_flag_writes_no_block(self):
         cfg, out = self.written([])
-        self.assertEqual(cfg["sampling"], THINKING)                 # thinking is the default
-        self.assertIn("sampling for requests that send none: thinking", out)
+        self.assertNotIn("sampling", cfg)                       # opt-in: greedy stays the path of no flag
+        self.assertNotIn("sampling for requests that send none", out)
 
     def test_numbers_written_by_hand_survive_a_run_that_names_no_flag(self):
         own = {"temperature": 0.5, "top_k": 8}
         code, out, cfg, _ = install(self.RAM, self.CARDS, self.ARGV, configs=(
             ("strata-iq3_s.json", {"args": ["--max-context", "131072"], "sampling": dict(own)}),))
         self.assertEqual(code, 0, out[-3000:])
-        self.assertEqual(cfg["sampling"], own)                      # the default does not replace them
+        self.assertEqual(cfg["sampling"], own)                      # a flagless run does not replace them
         self.assertIn("sampling for requests that send none: your own numbers", out)
 
     def test_both_flags_stop(self):
@@ -130,31 +129,32 @@ class SetupRunAgain(unittest.TestCase):
                     self.assertEqual(setup.choices_from_config(p)["sampling"], want)
 
 
-    def test_a_block_that_is_not_a_set_of_numbers_is_replaced_and_said(self):
-        """A "sampling" that is a name, a list or an empty block is not numbers: a run that names no flag says which
-        value it replaces instead of writing thinking quietly (the server would only refuse to start on such one)."""
+    def test_a_block_that_is_not_a_set_of_numbers_is_left_and_said(self):
+        """A "sampling" that is a name, a list or a bare value is not numbers: a run that names no flag leaves the
+        config as it is and says which value it left, rather than quietly leaving a file the server refuses to
+        start on."""
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "strata-iq3_s.json"
-            for bad in ("warm", 5, ["temperature"], {}):
+            for bad in ("warm", 5, ["temperature"]):
                 with self.subTest(bad=bad):
                     p.write_text(json.dumps({"sampling": bad}), encoding="utf-8")
-                    preset, block, dropped = setup.sampling_for_setup(None, p)
-                    self.assertEqual(preset, "thinking")
-                    self.assertEqual(block, THINKING)                        # and what it writes in its place
-                    self.assertEqual(dropped, bad)
+                    preset, block, left = setup.sampling_for_setup(None, p)
+                    self.assertIsNone(preset)
+                    self.assertIsNone(block)                        # this run writes nothing of its own
+                    self.assertEqual(left, bad)                     # ...and the caller says what it left
 
-    def test_nothing_is_reported_when_no_block_of_ours_is_replaced(self):
-        """No key, a key set to null, no config file at all: thinking with no word about it, because nothing the user
-        wrote is going away; and a block that is numbers stays the user's own."""
+    def test_nothing_is_written_or_said_when_no_flag_names_a_block(self):
+        """No key, a key set to null, no config file at all, an empty block: nothing written and no word about it;
+        a block that holds numbers stays the user's own."""
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "strata-iq3_s.json"
-            p.write_text(json.dumps({"sampling": None}), encoding="utf-8")
-            self.assertEqual(setup.sampling_for_setup(None, p)[:2],
-                             ("thinking", setup.sampling_choice("thinking")))
-            self.assertIsNone(setup.sampling_for_setup(None, p)[2])
-            self.assertIsNone(setup.sampling_for_setup(None, Path(tmp) / "strata-nothing.json")[2])
+            for js in ({"sampling": None}, {"sampling": {}}):
+                with self.subTest(js=js):
+                    p.write_text(json.dumps(js), encoding="utf-8")
+                    self.assertEqual(setup.sampling_for_setup(None, p), (None, None, None))
+            self.assertEqual(setup.sampling_for_setup(None, Path(tmp) / "strata-nothing.json"), (None, None, None))
             p.write_text(json.dumps({"sampling": {"temperature": 0.5}}), encoding="utf-8")
-            self.assertIsNone(setup.sampling_for_setup(None, p)[2])
+            self.assertEqual(setup.sampling_for_setup(None, p), (None, {"temperature": 0.5}, None))
 
     def test_an_earlier_config_counts_for_its_own_model_only(self):
         """#1129 with #629: another folder's config lends its sampling only when it names this model - the same

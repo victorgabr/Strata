@@ -66,9 +66,8 @@ class CarryOver(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertNotIn("kept from", out)
         self.assertNotIn(".bak", out)
-        # #1129: a first install also gets the card's thinking numbers - the one key setup writes that the user owns
-        self.assertEqual(set(cfg) - setup.SETUP_KEYS, {"sampling"})
-        self.assertEqual(cfg["sampling"], setup.sampling_choice("thinking"))
+        self.assertFalse(set(cfg) - setup.SETUP_KEYS)   # setup writes only its own keys; #1129's block is opt-in
+        self.assertNotIn("sampling", cfg)               # a flagless install decodes greedy as before #1129
 
     def test_setup_keys_are_rewritten(self):
         code, out, first, _ = self.run_setup()

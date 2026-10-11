@@ -40,18 +40,17 @@ EDITABLE = [
 SPEC = {k: kind for k, kind, _ in EDITABLE}
 
 # #1129: Qwen's own recommended sampling, from the model card (huggingface.co/Qwen/Qwen3.8-Flash-Next): one set for
-# thinking answers, one for direct ("instruct") ones.  setup writes one of them as the config's "sampling" block
-# (--thinking / --instruct); the server names the preset on its start line, and setup's settings line shows the
-# numbers.  Sampling only: thinking on or off stays per request (reasoning_effort, the chat page's Thinking switch).
+# thinking answers, one for direct ("instruct") ones.  setup writes one of them as the config's "sampling" block only
+# when a flag names it (--thinking / --instruct) - without a flag a new install writes no block and requests that send
+# no sampling of their own decode greedy, byte-identical to before #1129; the server names the preset on its start
+# line, and setup's settings line shows the numbers.  Sampling only: thinking on or off stays per request
+# (reasoning_effort, the chat page's Thinking switch).
 SAMPLING_PRESETS = {
     "thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0,
                  "presence_penalty": 0.0, "repetition_penalty": 1.0},
     "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0,
                  "presence_penalty": 1.5, "repetition_penalty": 1.0},
 }
-DEFAULT_SAMPLING_PRESET = "thinking"                # #1129: the preset a setup run writes when the user names none.
-# The card recommends thinking for this model, so a new install gets it; a config that already has
-# sampling numbers of its own is left as it is.
 
 # the order the two lines below print the block in (the server's own list of supported keys)
 SAMPLING_ORDER = ("temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty",

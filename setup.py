@@ -29,8 +29,8 @@ answers, no questions), --setup (install another model / change settings instead
 (EXPERIMENTAL, off by default),
 --models-dir DIR, --gguf-dir DIR (use GGUF files you already have), --build (compile instead of the ready-made
 engine), --check (only check this PC), --resident-budget-gib N (UD-Q4_K_XL's or UD-IQ4_XS's experts in RAM),
---kv-streaming on|off|auto, --thinking / --instruct (the sampling the model card recommends, used for every client
-that asks for none).
+--kv-streaming on|off|auto, --thinking / --instruct (write the sampling the model card recommends into the model's
+config, for every client that asks for none; without a flag no block is written and those clients decode greedy).
 
 Setup recommends, it never forces: the recommended answers are the defaults (--yes, or Enter), and a bigger choice
 than it recommends - a longer context, more GPUs, a bigger RAM budget, a size it thinks will not fit - is kept, with
@@ -62,7 +62,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:                             # setup's own folder, for `import setup` from tools/
     sys.path.insert(0, str(ROOT))
-from serve.runconfig import (DEFAULT_SAMPLING_PRESET, SAMPLING_PRESETS, preset_of as sampling_preset,   # noqa: E402
+from serve.runconfig import (SAMPLING_PRESETS, preset_of as sampling_preset,                      # noqa: E402
                              sampling_summary)
 WIN = os.name == "nt"
 # #214: every Hugging Face file comes from a fixed commit of its repository (the `sha` of
@@ -3894,14 +3894,14 @@ def sampling_older(cfg_path: Path, adopted: Path | None) -> Path | None:
 
 
 def sampling_for_setup(mode, older: Path | None) -> tuple[str | None, dict | None, object]:
-    """#1129: what sampling a setup run writes into the new config, as (preset name, block, dropped).  Thinking is the
-    default: a config without a "sampling" block gets Qwen's thinking numbers, so a client that sends none of its own
-    samples like the card says.  Numbers the user wrote by hand stay theirs: (None, their block, None) comes back and
-    setup writes nothing (carry_over leaves the key alone).  A flag named on this run - --thinking or --instruct -
-    always wins.  `dropped`: a block this run replaces without a flag and cannot read as numbers (a name, a list, an
-    empty block) - setup says so rather than replacing it quietly.  A block that holds numbers but bad ones is left to
-    the server, which names the key that is wrong.  `older`: the config this run rewrites, or the earlier install's
-    config when this folder has none yet (#629)."""
+    """#1129: what sampling a setup run writes into the new config, as (preset name, block, left).  Writing the
+    block is opt-in: a run that names no flag writes none, and a client that sends no sampling of its own decodes
+    greedy until --thinking / --instruct or the About tab sets numbers.  Numbers the user wrote by hand stay theirs:
+    (None, their block, None) comes back and setup writes them back as they are.  A flag named on this run -
+    --thinking or --instruct - always wins.  `left`: a block this run leaves that is not a set of numbers at all (a
+    name, a list, a bare value) - setup says so rather than quietly leaving a config the server will refuse to start
+    on.  A block that holds numbers but bad ones is left to the server, which names the key that is wrong.  `older`:
+    the config this run rewrites, or the earlier install's config when this folder has none yet (#629)."""
     if mode:
         block = sampling_choice(mode)
         return (mode, block, None) if block else (None, None, None)
@@ -3912,7 +3912,7 @@ def sampling_for_setup(mode, older: Path | None) -> tuple[str | None, dict | Non
     own = old.get("sampling") if isinstance(old, dict) else None
     if isinstance(own, dict) and own:
         return None, own, None
-    return DEFAULT_SAMPLING_PRESET, sampling_choice(DEFAULT_SAMPLING_PRESET), own
+    return None, None, own if not isinstance(own, dict) else None
 
 
 def save_sampling_choice(cfg_path: Path, cfg: dict, mode) -> bool:
@@ -4954,13 +4954,14 @@ def main() -> int:
                     help="write the sampling the Qwen3.8-Flash-Next card recommends for thinking answers into the "
                          "model's strata-<model>.json, for every client that sends none of its own: temperature=1.0, "
                          "top_p=0.95, top_k=20, min_p=0, presence_penalty=0, repetition_penalty=1.  It sets sampling "
-                         "only: thinking on or off stays per request.  This is the default: a new install gets these "
-                         "numbers with no flag at all")
+                         "only: thinking on or off stays per request.  Without either flag no block is written, and "
+                         "clients that send none decode greedy")
     sp.add_argument("--instruct", dest="sampling_mode", action="store_const", const="instruct",
                     help="the same card's numbers for direct (non-thinking) answers instead: temperature=0.7, "
-                         "top_p=0.8, top_k=20, min_p=0, presence_penalty=1.5, repetition_penalty=1.  Numbers you "
-                         "wrote by hand are kept over a setup run that names no flag; to decode greedy, set "
-                         "sampling.temperature to 0 on the web page or in strata-<model>.json")
+                         "top_p=0.8, top_k=20, min_p=0, presence_penalty=1.5, repetition_penalty=1.  Note: "
+                         "presence_penalty is not applied in batch windows (--parallel N, docs/BATCHING.md).  "
+                         "Numbers you wrote by hand are kept over a setup run that names no flag; to decode greedy, "
+                         "set sampling.temperature to 0 on the web page or in strata-<model>.json")
     ap.add_argument("--low-ram", choices=["auto", "on", "off", "resident", "mmap"], default="auto",
                     help="read the model's experts from one file in its folder instead of copying them all into RAM "
                          "(for a PC with a big GPU and little RAM); auto: when the experts would not fit the RAM. In "
@@ -5833,12 +5834,14 @@ def main() -> int:
     if a.browser is not None:                          # #609: only when given (else an earlier choice is carried over)
         cfg["open_browser"] = a.browser
     cfg_path = ROOT / f"strata-{tag.lower()}.json"   # #1129: read here too, to keep numbers the user wrote by hand
-    # thinking is the default when no flag is named; hand-written numbers come from the config being rewritten, or
-    # from an earlier install's config when that names this same model (sampling_older, the #629 condition)
+    # writing the block is opt-in: a flag names it, a run without a flag writes none; hand-written numbers come from
+    # the config being rewritten, or from an earlier install's config when that names this same model (sampling_older,
+    # the #629 condition)
     earlier = sampling_older(cfg_path, adopted)
-    preset, block, dropped = sampling_for_setup(a.sampling_mode, earlier)
-    if dropped is not None:                 # a block that is not numbers: say what this run replaces instead of it
-        warn(f'the earlier {earlier.name} held "sampling": {dropped!r}, which holds no numbers of yours to keep')
+    preset, block, left = sampling_for_setup(a.sampling_mode, earlier)
+    if left is not None:        # not numbers, left as it is: say where it came from, the server will stop and name it
+        warn(f'the earlier {earlier.name} holds "sampling": {left!r}, which is not a set of numbers; it stays and '
+             "the server will stop on it until --thinking or --instruct replaces it")
     if block:
         cfg["sampling"] = block
         named = preset or sampling_preset(block) or "your own numbers"

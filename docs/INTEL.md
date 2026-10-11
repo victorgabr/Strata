@@ -67,8 +67,8 @@ questions are setup's own. What changes:
   32K and 2,048 MiB with 4,096-token prompt chunks above that, 300 MiB on a card under 12 GB; a
   `--vram-reserve-mib N` you give is kept as given. KV streaming (`--kv-resident 32768`) is on from
   64K up when the RAM holds the KV. A `model_switcher` block from an earlier config is kept, and so is its `sampling`
-  block (#1129) - but not over a choice this run made: setup writes the card's thinking set for a new install, and
-  `--thinking` / `--instruct` names either set; the block it wrote survives this rewrite.
+  block (#1129) - but not over a choice this run made: setup writes one of the card's two sets only when
+  `--thinking` / `--instruct` names it, and the block it wrote survives this rewrite.
   `run-<model>.sh` starts `sycl/serve/server_intel.py`.
 - **Arc A-series (`i915`, e.g. the A750 with 8 GB):** a different config, see "Arc A750 and the other Alchemist cards" below.
 - **Engine settings:** the config's `"env"` block reaches the engine. `strata-sycl.sh` forwards every variable starting with
