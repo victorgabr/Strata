@@ -109,16 +109,18 @@ def pick(measured: dict, default_key, min_gain: float = MIN_GAIN):
 
 
 class Session:
-    """One running engine: measure decode tok/s for a setting (the median of the prompts' rates)."""
+    """One running engine: measure decode tok/s for a setting (the median of the prompts' rates).  `sampling`: the
+    run config's "sampling" block (#1129) when it has one; requests here still decode greedy when it has none."""
 
-    def __init__(self, engine, ids_list):
+    def __init__(self, engine, ids_list, sampling: dict | None = None):
         self.engine = engine
         self.ids_list = ids_list
+        self.sampling = {"temperature": 0, **(sampling or {})}
 
     def rate(self, tune: dict | None = None, max_new: int | None = None) -> float:
         rates = []
         for ids in self.ids_list:
-            sampling = {"temperature": 0}
+            sampling = dict(self.sampling)
             if tune:
                 sampling["strata_tune"] = tune
             n = sum(1 for t in self.engine.generate(ids, max_new or MAX_NEW, sampling, threading.Event())
@@ -133,9 +135,19 @@ class Session:
             self.rate()
 
 
-def run(cfg: dict, say=print, start_engine=None) -> dict:
+def sampling_block(cfg: dict) -> dict:
+    """The run config's "sampling" block (#1129) to decode the measurement prompts with; {} when there is none or it
+    is not a set of numbers - the server refuses such a block at its start, a calibration only says it measured
+    greedy."""
+    s = cfg.get("sampling")
+    return s if isinstance(s, dict) else {}
+
+
+def run(cfg: dict, say=print, start_engine=None, sampling: dict | None = None) -> dict:
     """Measure on the engine `cfg` describes; returns {"settings": {flag: value}, "report": {...}}.
-    `start_engine(args)` returns a started engine (serve.server.StrataEngine or a stand-in in tests)."""
+    `start_engine(args)` returns a started engine (serve.server.StrataEngine or a stand-in in tests).
+    `sampling`: the numbers the prompts decode with, named by a caller (--calibrate --thinking / --instruct);
+    None falls back to the run config's own "sampling" block, and no block to greedy."""
     if start_engine is None:
         from serve.server import StrataEngine, child_env
 
@@ -150,7 +162,8 @@ def run(cfg: dict, say=print, start_engine=None) -> dict:
     tok = ST.Tokenizer(toks, (tpath / "merges.txt").read_text(encoding="utf-8").split("\n"),
                        json.loads((tpath / "token_type.json").read_text()))
     ids_list = [chat_ids(tok, p) for p in PROMPTS]
-    return measure(engine_args(cfg), ids_list, start_engine, say, host_worker_extras())
+    return measure(engine_args(cfg), ids_list, start_engine, say, host_worker_extras(),
+                   sampling=sampling_block(cfg) if sampling is None else sampling)
 
 
 def engine_args(cfg: dict) -> list[str]:
@@ -199,7 +212,7 @@ def sweep(s, values: list, base_tune: dict, key: str, label: str, say) -> dict:
     return out
 
 
-def measure(base_args: list[str], ids_list, start_engine, say=print, extra_workers=()) -> dict:
+def measure(base_args: list[str], ids_list, start_engine, say=print, extra_workers=(), sampling: dict | None = None) -> dict:
     t0 = time.time()
     report: dict = {}
     say("  Loading the model for the measurements ...")
@@ -210,7 +223,7 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
         d_pcie = float(info.get("pcie_frac", 0.55))
         d_minp = float(info.get("spec_min_p", 0.5))
         d_workers = int(info.get("pool_workers", 0)) or None
-        s = Session(eng, ids_list)
+        s = Session(eng, ids_list, sampling)
         s.warm_up()
         # 1. the PCIe share, at the default draft floor
         by_pcie = sweep(s, sorted(set(PCIE_FRACS) | {round(d_pcie, 2)}), {"spec_min_p": d_minp}, "pcie_frac",
@@ -250,7 +263,7 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
             if e is None:
                 continue
             try:
-                sw = Session(e, ids_list)
+                sw = Session(e, ids_list, sampling)
                 sw.warm_up(1)
                 by_workers[w] = [sw.rate(), sw.rate()]
                 say(f"    {w} workers: {statistics.median(by_workers[w]):.1f} tok/s")
@@ -276,7 +289,7 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
         if e is None:
             continue
         try:
-            sa = Session(e, ids_list)
+            sa = Session(e, ids_list, sampling)
             sa.warm_up(1)
             by_adapt[key] = [sa.rate(max_new=TIER_MAX_NEW), sa.rate(max_new=TIER_MAX_NEW)]
             say(f"    {statistics.median(by_adapt[key]):.1f} tok/s")

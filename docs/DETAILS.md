@@ -501,6 +501,12 @@ install; `START-HERE.bat --calibrate` (Linux: `./setup.sh --calibrate`) does it 
 speed with each setting and keeps one only when it is more than 3% faster. The result is remembered per PC and model
 (in the settings file next to the data folder's record), so updates keep it.
 
+`--calibrate --thinking` or `--instruct` decodes the measurement prompts with that set - the way requests will
+decode once the flag is saved for the model (#1129) - because draft acceptance, and with it the best draft floor,
+depends on whether requests sample or go greedy.  The result is remembered under those numbers: a start with the
+same preset finds it, a greedy start or the other preset keeps its own tuning.  Without the flags the run config's
+own `"sampling"` block decides, and a model that has none measures greedy, as before.
+
 Measuring the worker count needs a fresh engine, so the model is loaded more than once: the PC is busy, and can
 stop responding for a minute or two, once per restart. It then starts the model, like a plain `START-HERE.bat`.
 

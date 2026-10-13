@@ -4779,10 +4779,14 @@ def hip_config_cards(sel) -> list[dict]:
     return cards
 
 
-def hardware_key(cfg: dict) -> str:
+def hardware_key(cfg: dict, sampling: dict | None = None) -> str:
     """What a calibration is valid for: this GPU, CPU and RAM, and the model with its context and images setting
     (the context's KV cache and the image encoder take VRAM from the expert cache).  #566: a HIP config's cards are
-    AMD's (hip_config_cards) - nvidia-smi's list named them "?" (or another card with that number) before."""
+    AMD's (hip_config_cards) - nvidia-smi's list named them "?" (or another card with that number) before.  #1129:
+    the numbers the measurements decoded with name the key too - `sampling`, or the run config's own "sampling"
+    block: draft acceptance, and so the best draft floor, depends on how requests decode, and a calibration measured
+    with one set is never applied as if it had measured another.  No numbers named keeps the earlier key, so every
+    calibration saved before stays valid."""
     sel = cfg.get("gpu")
     if cfg.get("backend") == "hip":
         gl = hip_config_cards(sel)
@@ -4791,25 +4795,37 @@ def hardware_key(cfg: dict) -> str:
     g = {"name": " + ".join(x.get("name", "?") for x in gl), "vram_gb": sum(x.get("vram_gb", 0) for x in gl)}
     a = cfg.get("args", [])
     ctx = a[a.index("--max-context") + 1] if "--max-context" in a else "?"
+    block = cfg.get("sampling") if sampling is None else sampling
+    s = sampling_summary(block) if isinstance(block, dict) else ""
     return "|".join([g.get("name", "?"), f"{g.get('vram_gb', 0):.0f}GB", cpu_info()[0], f"{ram_gb():.0f}GB",
-                     cfg.get("model_name", "?"), ctx, "images" if "--vision" in a else "text"])
+                     cfg.get("model_name", "?"), ctx, "images" if "--vision" in a else "text"]
+                    + ([f"sampling: {s}"] if s else []))
 
 
-def calibrate_config(cfg_path: Path) -> bool:
+def calibrate_config(cfg_path: Path, sampling_mode: str | None = None) -> bool:
     """Measure the engine's hardware-dependent settings on this PC (tools/calibrate.py), write them into the run
-    config and remember them per PC and model in the settings file, so an update or a reinstall keeps them."""
+    config and remember them per PC and model in the settings file, so an update or a reinstall keeps them.
+    #1129: --thinking / --instruct next to --calibrate decode the measurement prompts with the set the flag names,
+    a run that names no flag uses the run config's own "sampling" block; neither: greedy, as before."""
     sys.path.insert(0, str(ROOT / "tools"))
     import calibrate as CAL
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     say()
     say("  Tuning Strata for this PC: the output speed is measured with a few engine settings (the PCIe share, the")
     say("  draft depth, the CPU threads, the expert cache). It takes roughly 15-30 minutes (3 rounds of each value); the PC is busy meanwhile.")
+    want = (SAMPLING_PRESETS.get(sampling_mode) if sampling_mode
+            else cfg.get("sampling") if isinstance(cfg.get("sampling"), dict) else None)
+    if want and sampling_summary(want):
+        say(f"  The measurements decode the way this model's requests will: sampling "
+            f"{sampling_preset(want) or 'own'}: {sampling_summary(want)}"
+            + (", the numbers the flag named" if sampling_mode else " (the run config's block)")
+            + "; without them the calibration measures greedy instead.")
     try:
         since = os.path.getsize(cfg["log"]) if cfg.get("log") and os.path.isfile(cfg["log"]) else 0
     except OSError:
         since = 0
     try:
-        res = CAL.run(cfg, say=say)
+        res = CAL.run(cfg, say=say, sampling=want)
     except Exception as e:                             # never stops an install: the defaults stay
         warn(f"the tuning did not finish ({e}): the default settings stay")
         why = CAL.engine_error(cfg.get("log"), since)  # #447: the engine's own reason, not only "see the log"
@@ -4819,7 +4835,8 @@ def calibrate_config(cfg_path: Path) -> bool:
     cfg["args"] = CAL.apply(cfg["args"], res["settings"])
     write_config(cfg_path, cfg)
     st = load_settings()
-    st.setdefault("calibration", {})[hardware_key(cfg)] = {"settings": res["settings"], "tok_s": res["report"].get("tok_s"),
+    st.setdefault("calibration", {})[hardware_key(cfg, want)] = {"settings": res["settings"],
+                                                                 "tok_s": res["report"].get("tok_s"),
                                                            "date": time.strftime("%Y-%m-%d")}
     save_settings(st)
     if res["settings"]:
@@ -5855,7 +5872,9 @@ def main() -> int:
                     help="where the ready-made engine is (a URL folder or a local folder)")
     ap.add_argument("--check", action="store_true", help="only check this PC and exit")
     ap.add_argument("--calibrate", action="store_true",
-                    help="tune the engine's settings for this PC (about 15-30 minutes, longer on a slow card), then start the model")
+                    help="tune the engine's settings for this PC (about 15-30 minutes, longer on a slow card), then "
+                         "start the model; with --thinking / --instruct the measurements decode with that set, as "
+                         "the saved choice will have requests decode, and the calibration is remembered for it")
     ap.add_argument("--draft-vocab", choices=list(DRAFT_VOCABS),
                     help="the draft layer's tokens: cjk = with Chinese, Japanese and Korean (default), en = English "
                          "and code only (~110 MiB less VRAM, English answers 1-2%% faster), cyrillic = English, code "
@@ -5989,7 +6008,7 @@ def main() -> int:
             for i, c in enumerate(have, 1):
                 say(f"  {i}) {json.loads(c.read_text(encoding='utf-8-sig')).get('model_name', c.stem)}")
             pick_cfg = have[int(ask("Tune which one?", [str(i) for i in range(1, len(have) + 1)], "1", a.yes)) - 1]
-        if not calibrate_config(pick_cfg):             # #447: said again where it is not lost above the start
+        if not calibrate_config(pick_cfg, a.sampling_mode):   # #447: said again where it is not lost above the start
             say()
             warn("this PC is NOT tuned: the tuning failed (the reason is above); the model "
                  + ("keeps" if a.no_start else "starts with") + " the default settings")

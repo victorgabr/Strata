@@ -14,6 +14,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -242,6 +243,49 @@ class StartSavesTheChoice(unittest.TestCase):
         # the same way (pinned in serve/test_runconfig.py), so neither line calls it a preset the other does not
         self.assertIn("sampling own: temperature=1.0",
                       setup.settings_summary({"args": [], "sampling": {**THINKING, "seed": None}}, 8080))
+
+
+class CalibrationKey(unittest.TestCase):
+    """#1129 + calibration: hardware_key names the run config's "sampling" block, so a calibration measured with
+    those numbers is never applied as if the model decoded greedy - and a config without a block keeps the old key,
+    so every calibration saved before stays valid."""
+
+    CFG = {"gpu": 0, "model_name": "qwen3.8-flash-next-iq3_s", "args": ["--max-context", "32768"]}
+
+    def setUp(self):
+        self.patches = [
+            mock.patch.object(setup, "gpu_info",
+                              lambda i: {"name": "NVIDIA GeForce RTX 3060", "vram_gb": 12.0}),
+            mock.patch.object(setup, "cpu_info", lambda: ("AMD Ryzen 5 5600X", 6)),
+            mock.patch.object(setup, "ram_gb", lambda: 31.2)]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+
+    def key(self, extra):
+        return setup.hardware_key(dict(self.CFG, **extra))
+
+    def test_a_config_without_a_block_keeps_the_old_key(self):
+        self.assertNotIn("sampling", self.key({}))
+        self.assertTrue(self.key({}).endswith("|32768|text"))
+
+    def test_the_named_numbers_become_part_of_the_key(self):
+        self.assertEqual(self.key({"sampling": THINKING}),
+                         self.key({}) + "|sampling: " + runconfig.sampling_summary(THINKING))
+
+    def test_the_two_presets_are_two_calibrations(self):
+        self.assertNotEqual(self.key({"sampling": THINKING}), self.key({"sampling": INSTRUCT}))
+
+    def test_a_block_that_is_not_a_set_of_numbers_leaves_the_key_as_it_was(self):
+        self.assertEqual(self.key({"sampling": "thinking"}), self.key({}))
+
+    def test_numbers_named_by_a_flag_name_the_key_as_if_the_block_were_written(self):
+        # a --calibrate --thinking run keys its result by the flag's numbers; the start that later writes the
+        # block (#1129) finds that result again - same numbers, one key
+        self.assertEqual(setup.hardware_key(dict(self.CFG), THINKING), self.key({"sampling": THINKING}))
 
 
 if __name__ == "__main__":

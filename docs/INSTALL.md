@@ -235,6 +235,9 @@ busy, and can stop responding for a minute or two, once per restart. When it fin
 so the server is already running when it returns - do not start it a second time.
 NVIDIA cards for now. [What it measures](DETAILS.md#double-click-start-herebat).
 
+Add `--thinking` or `--instruct` to `--calibrate` when you use one of them: the measurement then decodes with
+that sampling, and its result is remembered for that sampling alone (greedy accepts drafts differently).
+
 ## Options without questions
 
 ```

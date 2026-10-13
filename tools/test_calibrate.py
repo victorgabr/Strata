@@ -22,7 +22,7 @@ import calibrate as CAL  # noqa: E402
 class FakeEngine:
     """Speed = f(pcie_frac, spec_min_p, workers): the GEN line's tune keys arrive as `strata_tune`."""
 
-    def __init__(self, args, speed, info_workers=6, starts=None, adapt=None):
+    def __init__(self, args, speed, info_workers=6, starts=None, adapt=None, seen=None):
         self.args = list(args)
         self.adapt_bonus = (adapt or {}).get(CAL.arg_value(args, "--adapt-swaps"), 1.0)
         w = CAL.arg_value(args, "--pool-workers")
@@ -31,10 +31,13 @@ class FakeEngine:
         self.speed = speed
         self.last = {}
         self.proc = None
+        self.seen = seen
         if starts is not None:
             starts.append(list(args))
 
     def generate(self, ids, max_new, sampling, cancel):
+        if self.seen is not None:
+            self.seen.append(dict(sampling))
         tune = sampling.get("strata_tune") or {}
         rate = self.speed(tune.get("pcie_frac", 0.55), tune.get("spec_min_p", self.info["spec_min_p"]), self.workers)
         rate *= self.adapt_bonus
@@ -157,14 +160,16 @@ class Calibrate(unittest.TestCase):
             (tok / "token_type.json").write_text(json.dumps([1, 1]))
             seen = []
             saved = CAL.measure
-            CAL.measure = lambda args, ids_list, start_engine, say=print, extra=(): seen.append(args) or {}
+            CAL.measure = lambda args, ids_list, start_engine, say=print, extra=(), sampling=None: \
+                seen.append((args, sampling)) or {}
             fake = type("ST", (), {"Tokenizer": lambda *a: type("T", (), {"encode": lambda s, t, **k: [0]})()})
             try:
                 with mock.patch.dict(sys.modules, {"strata_tokenizer": fake}):
-                    CAL.run({"tokenizer": d, "args": list(BASE), "gpu": [0]}, start_engine=lambda a: None)
+                    CAL.run({"tokenizer": d, "args": list(BASE), "gpu": [0],
+                             "sampling": {"temperature": 0.7}}, start_engine=lambda a: None)
             finally:
                 CAL.measure = saved
-        self.assertEqual(seen, [BASE])
+        self.assertEqual(seen, [(BASE, {"temperature": 0.7})])   # the server's args and the config's numbers
 
     def test_engine_error(self):
         with tempfile.TemporaryDirectory() as d:
@@ -198,7 +203,7 @@ class Calibrate(unittest.TestCase):
         self.assertEqual(CAL.pick({}, "a"), "a")
 
 
-class SetupIntegration(unittest.TestCase):
+class _SetupFixture(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.old = {k: os.environ.get(k) for k in ("APPDATA", "XDG_CONFIG_HOME")}
@@ -220,11 +225,14 @@ class SetupIntegration(unittest.TestCase):
                 os.environ[k] = v
         self.tmp.cleanup()
 
+class SetupIntegration(_SetupFixture):
+
     def test_calibrate_config_writes_and_remembers(self):
         cfg_path = Path(self.tmp.name) / "strata-q2_0.json"
         cfg = {"exe": "x", "args": list(BASE), "model_name": "qwen3.8-flash-next-q2_0"}
         cfg_path.write_text(json.dumps(cfg))
-        CAL.run = lambda c, say=print, start_engine=None: {"settings": {"--pcie-frac": "0.20"}, "report": {"tok_s": 61.2}}
+        CAL.run = lambda c, say=print, start_engine=None, sampling=None: {"settings": {"--pcie-frac": "0.20"},
+                                                                          "report": {"tok_s": 61.2}}
         self.assertTrue(self.S.calibrate_config(cfg_path))
         written = json.loads(cfg_path.read_text())
         self.assertEqual(CAL.arg_value(written["args"], "--pcie-frac"), "0.20")
@@ -276,6 +284,92 @@ class SetupIntegration(unittest.TestCase):
         self.assertIn("this PC is NOT tuned: the tuning failed (the reason is above); the model keeps the default "
                       "settings", out.getvalue())
 
+
+class SamplingArm(_SetupFixture):
+    """#1129 + --calibrate --thinking / --instruct: the measurement prompts decode with the set the flag names,
+    and the result is remembered under exactly those numbers - a greedy start or a start of the other preset must
+    not pick them up.  Without a flag the run config's own block decides; with nothing named, greedy as before and
+    the saved key is the one of every earlier calibration."""
+
+    THINKING = {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0,
+                "presence_penalty": 0.0, "repetition_penalty": 1.0}
+    INSTRUCT = {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0,
+                "presence_penalty": 1.5, "repetition_penalty": 1.0}
+
+    def calibrate(self, cfg, mode=None):
+        import contextlib
+        import io
+        seen = {}
+
+        def fake_run(c, say=print, start_engine=None, sampling=None):
+            seen["sampling"] = sampling
+            return {"settings": {"--spec-min-p": "0.70"}, "report": {"tok_s": 63.0}}
+        CAL.run = fake_run
+        cfg_path = Path(self.tmp.name) / "strata-m.json"
+        cfg_path.write_text(json.dumps(cfg))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertTrue(self.S.calibrate_config(cfg_path, mode))
+        return seen.get("sampling"), json.loads(cfg_path.read_text()), out.getvalue()
+
+    def test_a_flag_names_the_numbers_and_the_key(self):
+        sampling, written, out = self.calibrate({"exe": "x", "args": list(BASE), "model_name": "m"}, "thinking")
+        self.assertEqual(sampling, self.THINKING)
+        self.assertIn("sampling thinking: temperature=1.0, top_p=0.95", out)
+        self.assertEqual(self.S.saved_calibration({**written, "sampling": self.THINKING})["settings"],
+                         {"--spec-min-p": "0.70"})
+        self.assertIsNone(self.S.saved_calibration(written))                    # not for a greedy start
+        self.assertIsNone(self.S.saved_calibration({**written, "sampling": self.INSTRUCT}))
+
+    def test_a_flag_beats_the_configs_block(self):
+        sampling, written, _ = self.calibrate({"exe": "x", "args": list(BASE), "model_name": "m",
+                                               "sampling": self.INSTRUCT}, "thinking")
+        self.assertEqual(sampling, self.THINKING)
+        self.assertIsNone(self.S.saved_calibration({**written, "sampling": self.INSTRUCT}))
+
+    def test_without_a_flag_the_configs_own_block_decodes(self):
+        sampling, written, out = self.calibrate({"exe": "x", "args": list(BASE), "model_name": "m",
+                                                 "sampling": self.INSTRUCT})
+        self.assertEqual(sampling, self.INSTRUCT)
+        self.assertIn("sampling instruct: temperature=0.7", out)
+        self.assertEqual(self.S.saved_calibration({**written, "sampling": self.INSTRUCT})["settings"],
+                         {"--spec-min-p": "0.70"})
+
+    def test_nothing_named_decodes_greedy_and_keeps_the_old_key(self):
+        sampling, written, out = self.calibrate({"exe": "x", "args": list(BASE), "model_name": "m"})
+        self.assertIsNone(sampling)                                             # measure() keeps its greedy pin
+        self.assertNotIn("sampling", out)
+        self.assertEqual(self.S.saved_calibration(written)["settings"], {"--spec-min-p": "0.70"})
+
+
+class MeasureDecoding(unittest.TestCase):
+    """The named numbers reach every measurement decode - every prompt, every engine restart - while strata_tune
+    keeps carrying the settings under test."""
+
+    THINKING = {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0,
+                "presence_penalty": 0.0, "repetition_penalty": 1.0}
+
+    def measure(self, sampling):
+        seen = []
+        CAL.measure(BASE, [[1, 2, 3]] * 3, lambda a: FakeEngine(a, lambda f, p, w: 50.0, 6, None, None, seen),
+                    say=lambda *_: None, sampling=sampling)
+        return seen
+
+    def test_the_engine_sees_the_named_numbers_on_every_decode(self):
+        seen = self.measure(self.THINKING)
+        self.assertTrue(seen)
+        self.assertTrue(all(s["temperature"] == 1.0 and s["top_p"] == 0.95 and s["top_k"] == 20 for s in seen))
+        self.assertTrue(any(s.get("strata_tune") for s in seen))                # the sweep still tunes
+
+    def test_nothing_named_stays_greedy(self):
+        seen = self.measure(None)
+        self.assertTrue(seen)
+        self.assertTrue(all(s["temperature"] == 0 for s in seen))
+
+    def test_the_config_block_is_read_and_a_broken_one_ignored(self):
+        self.assertEqual(CAL.sampling_block({}), {})
+        self.assertEqual(CAL.sampling_block({"sampling": "thinking"}), {})
+        self.assertEqual(CAL.sampling_block({"sampling": self.THINKING}), self.THINKING)
 
 if __name__ == "__main__":
     unittest.main()
